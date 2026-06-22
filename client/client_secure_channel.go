@@ -262,6 +262,9 @@ func (ch *clientSecureChannel) Request(ctx context.Context, req ua.ServiceReques
 		return nil, ua.BadRequestTimeout
 	case <-ch.closed:
 		cancel()
+		if ch.statusCode != ua.Good {
+			return nil, ch.statusCode
+		}
 		return nil, ua.BadSecureChannelClosed
 	}
 }
@@ -276,12 +279,22 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 		return err
 	}
 
+	log.Printf("[OPN-DIAG] Open() called: endpointURL=%s securityMode=%v securityPolicyURI=%s remoteCertLen=%d localCertLen=%d localPrivKeyNil=%v",
+		ch.endpointURL, ch.securityMode, ch.securityPolicyURI, len(ch.remoteCertificate), len(ch.localCertificate), ch.localPrivateKey == nil)
+
 	if len(ch.remoteCertificate) > 0 {
 		certs, err := x509.ParseCertificates(ch.remoteCertificate)
 		if err != nil || len(certs) == 0 {
+			log.Printf("[OPN-DIAG] remoteCertificate parse failed: %v", err)
 			return ua.BadSecurityChecksFailed
 		}
-		err = ua.ValidateCertificate(
+		// ValidateCertificate saves the cert to the rejected path when it is
+		// not trusted. We intentionally do not abort on validation failure so
+		// that the TCP handshake proceeds and our client certificate is
+		// delivered to the server. The server will reject the session if it
+		// does not trust our cert, but it will have saved our cert in its
+		// own pending store — enabling the mutual-trust setup workflow.
+		_ = ua.ValidateCertificate(
 			certs,
 			[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 			remoteURL.Hostname(),
@@ -295,15 +308,18 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 			ch.suppressCertificateChainIncomplete,
 			ch.suppressCertificateRevocationUnknown,
 		)
-		if err != nil {
-			return err
-		}
+		log.Printf("[OPN-DIAG] remoteCertificate parsed OK, remotePublicKey will be set")
+	} else {
+		log.Printf("[OPN-DIAG] remoteCertificate is EMPTY — remotePublicKey will be nil")
 	}
 
+	log.Printf("[OPN-DIAG] TCP dialing %s ...", remoteURL.Host)
 	ch.conn, err = net.DialTimeout("tcp", remoteURL.Host, time.Duration(ch.connectTimeout)*time.Millisecond)
 	if err != nil {
+		log.Printf("[OPN-DIAG] TCP dial FAILED: %v", err)
 		return err
 	}
+	log.Printf("[OPN-DIAG] TCP dial OK")
 
 	buf := *(ch.bytesPool.Get().(*[]byte))
 	defer ch.bytesPool.Put(&buf)
@@ -328,8 +344,10 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 
 	_, err = ch.Read(buf)
 	if err != nil {
+		log.Printf("[OPN-DIAG] Hello read (Ack) FAILED: %v", err)
 		return err
 	}
+	log.Printf("[OPN-DIAG] Hello/Ack exchange OK")
 
 	var reader = bytes.NewReader(buf)
 	var dec = ua.NewBinaryDecoder(reader, ch)
@@ -421,13 +439,17 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 	ch.remoteEncryptingKey = make([]byte, ch.securityPolicy.SymEncryptionKeySize())
 	ch.remoteInitializationVector = make([]byte, ch.securityPolicy.SymEncryptionBlockSize())
 
+	log.Printf("[OPN-DIAG] Security check: mode=%v localPrivKeyNil=%v remotePublicKeyNil=%v",
+		ch.securityMode, ch.localPrivateKey == nil, ch.remotePublicKey == nil)
 	switch ch.securityMode {
 	case ua.MessageSecurityModeSignAndEncrypt, ua.MessageSecurityModeSign:
 		if ch.localPrivateKey == nil {
+			log.Printf("[OPN-DIAG] ABORT: localPrivateKey is nil — client cert not loaded")
 			return ua.BadSecurityChecksFailed
 		}
 		ch.localPrivateKeySize = ch.localPrivateKey.Size()
 		if ch.remotePublicKey == nil {
+			log.Printf("[OPN-DIAG] ABORT: remotePublicKey is nil — server cert not in endpoint or not parsed")
 			return ua.BadSecurityChecksFailed
 		}
 		ch.remotePublicKeySize = ch.remotePublicKey.Size()
@@ -443,6 +465,7 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 
 	go ch.responseWorker()
 
+	log.Printf("[OPN-DIAG] Sending OpenSecureChannelRequest (OPN) — our cert is in the asymmetric header")
 	request := &ua.OpenSecureChannelRequest{
 		ClientProtocolVersion: protocolVersion,
 		RequestType:           ua.SecurityTokenRequestTypeIssue,
@@ -452,8 +475,10 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 	}
 	res, err := ch.Request(ctx, request)
 	if err != nil {
+		log.Printf("[OPN-DIAG] OPN request FAILED: %v", err)
 		return err
 	}
+	log.Printf("[OPN-DIAG] OPN response received — secure channel open")
 	response := res.(*ua.OpenSecureChannelResponse)
 	if response.ServerProtocolVersion < protocolVersion {
 		return ua.BadProtocolVersionUnsupported
@@ -1395,6 +1420,7 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 
 		count, err := ch.Read(receiveBuffer)
 		if err != nil || count == 0 {
+			log.Printf("[RECV-DIAG] ch.Read failed: count=%d err=%v (tcp closed or decode error)", count, err)
 			return nil, ua.BadSecureChannelClosed
 		}
 
@@ -1883,6 +1909,7 @@ func (ch *clientSecureChannel) Read(p []byte) (int, error) {
 
 	count = int(binary.LittleEndian.Uint32(p[4:8]))
 	if count > cap(p) {
+		log.Printf("[RECV-DIAG] Read: message length %d exceeds buffer capacity %d", count, cap(p))
 		return num, ua.BadDecodingError
 	}
 

@@ -13,6 +13,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 
@@ -50,56 +51,74 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		}
 	}
 
-	// get endpoints from discovery url
+	// Attempt endpoint discovery. If the server refuses None-security discovery
+	// channels (returns EOF immediately) AND we already have the server certificate
+	// pre-loaded via WithServerCertificate(), fall back to a direct connection using
+	// the caller-configured security parameters.
 	req := &ua.GetEndpointsRequest{
 		EndpointURL: endpointURL,
 		ProfileURIs: []string{ua.TransportProfileURIUaTcpTransport},
 	}
-	res, err := GetEndpoints(ctx, req)
-	if err != nil {
-		return nil, err
-	}
+	res, discoveryErr := GetEndpoints(ctx, req)
 
-	// order endpoints by decreasing security level.
-	var orderedEndpoints = res.Endpoints
-	sort.Slice(orderedEndpoints, func(i, j int) bool {
-		return orderedEndpoints[i].SecurityLevel > orderedEndpoints[j].SecurityLevel
-	})
-
-	// if client certificate is not set then limit secuity policy to none
-	securityPolicyURI := cli.securityPolicyURI
-	securityMode := cli.securityMode
-	if securityPolicyURI == ua.SecurityPolicyURIBestAvailable && len(cli.localCertificate) == 0 {
-		securityPolicyURI = ua.SecurityPolicyURINone
-		securityMode = ua.MessageSecurityModeNone
-	}
-
-	// select first endpoint with matching policy uri and security mode.
-	var selectedEndpoint *ua.EndpointDescription
-	for _, e := range orderedEndpoints {
-		// filter out unsupported policy uri
-		switch e.SecurityPolicyURI {
-		case ua.SecurityPolicyURINone, ua.SecurityPolicyURIBasic128Rsa15,
-			ua.SecurityPolicyURIBasic256, ua.SecurityPolicyURIBasic256Sha256,
-			ua.SecurityPolicyURIAes128Sha256RsaOaep, ua.SecurityPolicyURIAes256Sha256RsaPss:
-		default:
-			continue
+	if discoveryErr != nil {
+		// Can we fall back to direct connect?
+		canFallback := len(cli.serverCertificate) > 0 &&
+			cli.securityPolicyURI != ua.SecurityPolicyURIBestAvailable &&
+			cli.securityPolicyURI != "" &&
+			cli.securityMode != ua.MessageSecurityModeInvalid &&
+			cli.securityMode != ua.MessageSecurityModeNone
+		if !canFallback {
+			return nil, discoveryErr
 		}
-		// if policy uri is a match
-		if (securityPolicyURI == "" || e.SecurityPolicyURI == securityPolicyURI) &&
-			(securityMode == ua.MessageSecurityModeInvalid || e.SecurityMode == securityMode) {
-			selectedEndpoint = &e
-			break
-		}
-	}
-	if selectedEndpoint == nil {
-		return nil, ua.BadSecurityModeRejected
-	}
+		log.Printf("[DIAL-DIAG] GetEndpoints failed (%v) — using pre-loaded server cert for direct connect (policy=%s mode=%v)",
+			discoveryErr, cli.securityPolicyURI, cli.securityMode)
+		// endpointURL, securityPolicyURI, securityMode, serverCertificate stay as configured.
+	} else {
+		// Normal path: select the best matching endpoint from the discovery response.
+		orderedEndpoints := res.Endpoints
+		sort.Slice(orderedEndpoints, func(i, j int) bool {
+			return orderedEndpoints[i].SecurityLevel > orderedEndpoints[j].SecurityLevel
+		})
 
-	cli.securityPolicyURI = selectedEndpoint.SecurityPolicyURI
-	cli.securityMode = selectedEndpoint.SecurityMode
-	cli.serverCertificate = []byte(selectedEndpoint.ServerCertificate)
-	cli.userTokenPolicies = selectedEndpoint.UserIdentityTokens
+		securityPolicyURI := cli.securityPolicyURI
+		securityMode := cli.securityMode
+		log.Printf("[DIAL-DIAG] pre-select: securityPolicyURI=%s securityMode=%v localCertLen=%d", securityPolicyURI, securityMode, len(cli.localCertificate))
+		if securityPolicyURI == ua.SecurityPolicyURIBestAvailable && len(cli.localCertificate) == 0 {
+			log.Printf("[DIAL-DIAG] localCertificate empty + BestAvailable policy → downgrading to None security")
+			securityPolicyURI = ua.SecurityPolicyURINone
+			securityMode = ua.MessageSecurityModeNone
+		}
+
+		var selectedEndpoint *ua.EndpointDescription
+		for _, e := range orderedEndpoints {
+			switch e.SecurityPolicyURI {
+			case ua.SecurityPolicyURINone, ua.SecurityPolicyURIBasic128Rsa15,
+				ua.SecurityPolicyURIBasic256, ua.SecurityPolicyURIBasic256Sha256,
+				ua.SecurityPolicyURIAes128Sha256RsaOaep, ua.SecurityPolicyURIAes256Sha256RsaPss:
+			default:
+				continue
+			}
+			if (securityPolicyURI == "" || e.SecurityPolicyURI == securityPolicyURI) &&
+				(securityMode == ua.MessageSecurityModeInvalid || e.SecurityMode == securityMode) {
+				selectedEndpoint = &e
+				break
+			}
+		}
+		if selectedEndpoint == nil {
+			log.Printf("[DIAL-DIAG] no matching endpoint found for policy=%s mode=%v", securityPolicyURI, securityMode)
+			return nil, ua.BadSecurityModeRejected
+		}
+
+		log.Printf("[DIAL-DIAG] selected endpoint: URL=%s policy=%s mode=%v serverCertLen=%d",
+			selectedEndpoint.EndpointURL, selectedEndpoint.SecurityPolicyURI, selectedEndpoint.SecurityMode, len(selectedEndpoint.ServerCertificate))
+
+		cli.endpointURL = selectedEndpoint.EndpointURL
+		cli.securityPolicyURI = selectedEndpoint.SecurityPolicyURI
+		cli.securityMode = selectedEndpoint.SecurityMode
+		cli.serverCertificate = []byte(selectedEndpoint.ServerCertificate)
+		cli.userTokenPolicies = selectedEndpoint.UserIdentityTokens
+	}
 
 	cli.localDescription = ua.ApplicationDescription{
 		ApplicationName: ua.LocalizedText{Text: cli.applicationName},
@@ -259,6 +278,24 @@ func (ch *Client) open(ctx context.Context) error {
 	remoteNonce = []byte(createSessionResponse.ServerNonce)
 	ch.sessionTimeout = createSessionResponse.RevisedSessionTimeout
 	ch.channel.maxRequestMessageSize = createSessionResponse.MaxRequestMessageSize
+
+	// When GetEndpoints was skipped (direct connect), userTokenPolicies is empty.
+	// Extract them from the CreateSessionResponse.ServerEndpoints so that activate()
+	// can select the correct PolicyID for the configured identity type.
+	if len(ch.userTokenPolicies) == 0 {
+		for _, ep := range createSessionResponse.ServerEndpoints {
+			if ep.SecurityPolicyURI == ch.securityPolicyURI && ep.SecurityMode == ch.securityMode {
+				ch.userTokenPolicies = ep.UserIdentityTokens
+				log.Printf("[DIAL-DIAG] populated userTokenPolicies from CreateSession response (%d policies)", len(ch.userTokenPolicies))
+				break
+			}
+		}
+		// If no exact match, fall back to the first available endpoint's policies.
+		if len(ch.userTokenPolicies) == 0 && len(createSessionResponse.ServerEndpoints) > 0 {
+			ch.userTokenPolicies = createSessionResponse.ServerEndpoints[0].UserIdentityTokens
+			log.Printf("[DIAL-DIAG] populated userTokenPolicies from first endpoint in CreateSession response (%d policies)", len(ch.userTokenPolicies))
+		}
+	}
 
 	// verify the server's certificate is the same as the certificate from the selected endpoint.
 	if !bytes.Equal(ch.serverCertificate, []byte(createSessionResponse.ServerCertificate)) {

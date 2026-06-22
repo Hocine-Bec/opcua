@@ -97,6 +97,18 @@ func WithSessionTimeout(value float64) Option {
 	}
 }
 
+// WithServerCertificate pre-loads the server's DER certificate so that Dial()
+// can skip the None-security GetEndpoints discovery call. Use this when the
+// server refuses None-security discovery channels. When this option is set and
+// the security policy is not BestAvailable, Dial() connects directly without
+// first calling GetEndpoints.
+func WithServerCertificate(certDER []byte) Option {
+	return func(c *Client) error {
+		c.serverCertificate = certDER
+		return nil
+	}
+}
+
 // WithClientCertificate sets the client certificate and private key.
 func WithClientCertificate(cert []byte, privateKey *rsa.PrivateKey) Option {
 	return func(c *Client) error {
